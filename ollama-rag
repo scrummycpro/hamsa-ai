@@ -1,0 +1,121 @@
+#!/bin/bash
+
+# SQLite database file
+DB_FILE="responses.db"
+
+# Default table name
+DEFAULT_TABLE_NAME="responses"
+TABLE_NAME="$DEFAULT_TABLE_NAME"
+
+# Variables for options
+PROMPT=""
+PROMPT_FILE=""
+NEW_TABLE=false
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prompt)
+      PROMPT="$2"
+      shift 2
+      ;;
+    --file)
+      PROMPT_FILE="$2"
+      shift 2
+      ;;
+    --new-table)
+      NEW_TABLE=true
+      shift
+      ;;
+    --table-name)
+      TABLE_NAME="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Usage: $0 [--prompt '<prompt>'] [--file <file_of_prompts>] [--new-table] [--table-name '<name>']"
+      exit 1
+      ;;
+  esac
+done
+
+# Validate input
+if [[ -z "$PROMPT" && -z "$PROMPT_FILE" ]]; then
+  echo "Error: You must provide either --prompt or --file."
+  exit 1
+fi
+
+# If the --new-table flag is set but no --table-name is provided, generate a table name
+if $NEW_TABLE && [[ "$TABLE_NAME" == "$DEFAULT_TABLE_NAME" ]]; then
+  TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+  TABLE_NAME="responses_$TIMESTAMP"
+  echo "Creating a new table with a generated name: $TABLE_NAME"
+fi
+
+# Create the SQLite table if it doesn't exist
+sqlite3 "$DB_FILE" <<EOF
+CREATE TABLE IF NOT EXISTS $TABLE_NAME (
+  id INTEGER PRIMARY KEY,
+  timestamp TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  response TEXT NOT NULL
+);
+EOF
+
+# Function to process a single prompt
+process_prompt() {
+  local PROMPT="$1"
+  
+  # Send the prompt to Ollama and capture the response
+  RESPONSE=$(curl -s -X POST http://localhost:11434/api/generate \
+    -H "Content-Type: application/json" \
+    -d "{
+          \"model\": \"llama3.2\",
+          \"prompt\": \"$PROMPT\",
+          \"stream\": false
+        }" | jq -r .response)
+
+  # Check if a response was generated
+  if [ -z "$RESPONSE" ]; then
+    echo "Error: No response generated for prompt: $PROMPT"
+    return
+  fi
+
+  # Get the current timestamp
+  TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+  # Escape single quotes in the prompt and response
+  ESCAPED_PROMPT=$(echo "$PROMPT" | sed "s/'/''/g")
+  ESCAPED_RESPONSE=$(echo "$RESPONSE" | sed "s/'/''/g")
+
+  # Insert the data into the SQLite database
+  sqlite3 "$DB_FILE" <<EOF
+INSERT INTO $TABLE_NAME (timestamp, prompt, response)
+VALUES ('$TIMESTAMP', '$ESCAPED_PROMPT', '$ESCAPED_RESPONSE');
+EOF
+
+  echo "Saved response for prompt: $PROMPT"
+}
+
+# Process a single prompt if provided
+if [[ -n "$PROMPT" ]]; then
+  process_prompt "$PROMPT"
+fi
+
+# Process a file of prompts if provided
+if [[ -n "$PROMPT_FILE" ]]; then
+  while IFS= read -r LINE || [ -n "$LINE" ]; do
+    # Skip empty lines
+    if [ -z "$LINE" ]; then
+      continue
+    fi
+    process_prompt "$LINE"
+  done < "$PROMPT_FILE"
+fi
+
+# Output success message
+if [[ "$TABLE_NAME" == "$DEFAULT_TABLE_NAME" ]]; then
+  echo "All prompts processed. Results saved in the default table: $DEFAULT_TABLE_NAME"
+else
+  echo "All prompts processed. Results saved in table: $TABLE_NAME"
+fi
